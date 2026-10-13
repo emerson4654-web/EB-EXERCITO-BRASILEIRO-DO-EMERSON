@@ -272,22 +272,40 @@ function cdpDurationMs(role, roles) {
   const name = normalizeRoleName(role?.name);
   const hour = 60 * 60 * 1000;
 
-  // Prazos pedidos: Recruta 2 h, Soldado 4 h, Cabo 8 h.
-  if (/\brecruta\b/.test(name)) return 2 * hour;
-  if (/\bsoldado\b/.test(name)) return 4 * hour;
-  if (/\bcabo\b/.test(name)) return 8 * hour;
+  // Tabela oficial da CDP do site: progressão de 3 horas por patente.
+  // Os códigos e nomes alternativos são aceitos porque o nome do cargo no Roblox pode variar.
+  const rules = [
+    [/\brecruta\b|\brec\b/, 3],
+    [/\bsoldado\b|\bsld\b/, 6],
+    [/\bcabo\b|\bcb\b/, 9],
+    [/\b(?:3|terceiro)\s*(?:sgt|sargento)\b/, 12],
+    [/\b(?:2|segundo)\s*(?:sgt|sargento)\b/, 15],
+    [/\b(?:1|primeiro)\s*(?:sgt|sargento)\b/, 18],
+    [/\bsubtenente\b|\bst\b/, 21],
+    [/\bcadete\b|\bct\b/, 24],
+    [/\baspirante(?: a oficial)?\b|\basp\b/, 27],
+    [/\b(?:2|segundo)\s*(?:ten|tenente)\b/, 30],
+    [/\b(?:1|primeiro)\s*(?:ten|tenente)\b/, 33],
+    [/\bcapitao\b|\bcap\b/, 36],
+    [/\bmajor\b|\bmaj\b/, 39],
+    [/\btenente coronel\b|\bten cel\b/, 42],
+    [/\bcoronel\b|\bcel\b/, 45],
+    [/\bgeneral de brigada\b|\bgen bda\b/, 48],
+    [/\bgeneral de divisao\b|\bgen dv\b/, 51],
+    [/\bgeneral de exercito\b|\bgen ex\b/, 54],
+    [/\belite militar\b|\bem\b/, 57],
+    [/\belite real\b|\belite secreta\b|\ber\b|\bes\b/, 60],
+    [/\bsubcomandante\b|\bscmt\b/, 63],
+    [/^comandante$|\bcmt\b/, 66]
+  ];
 
-  // As patentes acima de Cabo seguem a progressão dobrada: 16 h, 32 h, 64 h...
-  // Para funções abaixo de Cabo que não sejam Recruta/Soldado, reduz proporcionalmente.
-  const caboRole = (roles || []).find(r => /\bcabo\b/.test(normalizeRoleName(r.name)));
-  if (caboRole && Number.isFinite(Number(role?.order))) {
-    const steps = Number(caboRole.order) - Number(role.order);
-    if (steps > 0) return Math.min(720, 8 * (2 ** steps)) * hour;
-    if (steps < 0) return Math.max(1, 8 / (2 ** Math.abs(steps))) * hour;
+  for (const [pattern, hours] of rules) {
+    if (pattern.test(name)) return hours * hour;
   }
 
-  // Caso o grupo use nomes de patente diferentes, o prazo padrão seguro é 8 horas.
-  return 8 * hour;
+  // Cargo sem correspondência na tabela: usa 3 horas como padrão conservador.
+  // Ajuste o nome do cargo no Roblox para um dos nomes/códigos oficiais acima.
+  return 3 * hour;
 }
 
 function buildCdpStatus(record, roles) {
@@ -725,7 +743,7 @@ app.post('/api/promotions/execute', async (req, res) => {
     try { await savePersistentState(); }
     catch (saveError) {
       console.error('promotions/execute/save:', saveError.message);
-      persistenceWarning = ' Atenção: não consegui salvar o estado no disco; configure EB_DATA_DIR para um disco persistente no Render para manter os prazos após reinícios.';
+      persistenceWarning = ' Atenção: não consegui salvar os dados. Confira a conexão DATABASE_URL do PostgreSQL no Render.';
     }
 
     return res.json({ ok: true, message: `Promoção aplicada no Roblox: @${target.name} agora está em ${targetRole.name}.${cleanupWarning} Você poderá promover novamente em 30 minutos.${persistenceWarning}`, promotion: entry, result, partial: Boolean(cleanupWarning), cooldownRemainingMs: PROMOTION_COOLDOWN_MS });
@@ -918,7 +936,7 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
       try { await savePersistentState(); }
       catch (saveError) {
         console.error('promotions/execute-batch/save:', saveError.message);
-        persistenceWarning = ' Atenção: não consegui salvar os prazos no disco; configure EB_DATA_DIR em um disco persistente no Render.';
+        persistenceWarning = ' Atenção: não consegui salvar os prazos. Confira a conexão DATABASE_URL do PostgreSQL no Render.';
       }
     }
 
