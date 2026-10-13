@@ -5,6 +5,16 @@ const path = require('path');
 const fs = require('fs/promises');
 const os = require('os');
 
+// Banco PostgreSQL opcional para preservar CDP e cooldowns após reinícios do Render.
+// Sem DATABASE_URL, o site usa um arquivo local (que pode ser apagado em hospedagens gratuitas).
+const DatabasePool = process.env.DATABASE_URL ? require('pg').Pool : null;
+const statePool = DatabasePool
+  ? new DatabasePool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_SSL === 'disable' ? false : { rejectUnauthorized: false }
+    })
+  : null;
+
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -38,21 +48,14 @@ function getRateKey(req) {
 }
 
 function rateLimit(req, res, next) {
-  const key = getRateKey(req);
-  const now = Date.now();
+  const key = getRateKey(req), now = Date.now();
   let item = attempts.get(key);
-
-  if (!item || now > item.until) {
-    item = { count: 0, until: now + 60_000 };
-  }
-
+  if (!item || now > item.until) item = { count: 0, until: now + 60_000 };
   item.count++;
   attempts.set(key, item);
-
   if (item.count > 20) {
     return jsonError(res, 429, 'Muitas tentativas. Aguarde um minuto e tente novamente.');
   }
-
   next();
 }
 
@@ -67,9 +70,7 @@ async function robloxUserByUsername(username) {
     signal: AbortSignal.timeout(8000)
   });
 
-  if (!response.ok) {
-    throw new Error('Roblox não respondeu à consulta de usuário.');
-  }
+  if (!response.ok) throw new Error('Roblox não respondeu à consulta de usuário.');
 
   const data = await response.json();
   const user = Array.isArray(data.data) ? data.data[0] : null;
@@ -199,7 +200,6 @@ app.post('/api/auth/start', rateLimit, async (req, res) => {
 
     const code = `EBM-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 
-    // Um código pendente por usuário Roblox.
     for (const [key, value] of pending) {
       if (value.userId === user.id || value.expiresAt < Date.now()) {
         pending.delete(key);
@@ -223,7 +223,6 @@ app.post('/api/auth/start', rateLimit, async (req, res) => {
     });
   } catch (e) {
     console.error('auth/start:', e.message);
-
     return jsonError(
       res,
       502,
@@ -240,11 +239,7 @@ app.post('/api/auth/verify', rateLimit, async (req, res) => {
   const challenge = pending.get(code);
 
   if (!challenge) {
-    return jsonError(
-      res,
-      400,
-      'Código inválido ou inexistente. Gere um novo código.'
-    );
+    return jsonError(res, 400, 'Código inválido ou inexistente. Gere um novo código.');
   }
 
   if (challenge.expiresAt < Date.now()) {
@@ -295,7 +290,6 @@ app.post('/api/auth/verify', rateLimit, async (req, res) => {
     });
   } catch (e) {
     console.error('auth/verify:', e.message);
-
     return jsonError(
       res,
       502,
@@ -330,15 +324,15 @@ app.post('/api/auth/logout', (_req, res) => {
   res.json({ ok: true });
 });
 
+
 // Gestão de patentes e promoções do grupo Roblox.
-// A chave Open Cloud fica somente no servidor.
+// A chave Open Cloud fica somente no servidor (variável do Render), nunca no navegador.
 const ROBLOX_API_KEY = process.env.ROBLOX_API_KEY || '';
 
 const GROUP_ID = /^\d+$/.test(process.env.ROBLOX_GROUP_ID || '')
   ? process.env.ROBLOX_GROUP_ID
   : '13616747';
 
-// Coloque seu ID numérico do Roblox na variável ADMIN_USER_IDS do Render.
 const ADMIN_USER_IDS = new Set(
   (process.env.ADMIN_USER_IDS || '')
     .split(',')
@@ -348,9 +342,36 @@ const ADMIN_USER_IDS = new Set(
 
 const promotionHistory = [];
 const proofFiles = new Map();
-const PROOF_DIR = path.join(os.tmpdir(), 'eb-manager-proofs');
+const promotionCooldowns = new Map();
+const promotionLocks = new Set();
+const cdpRecords = new Map();
 
-async function promotionAccess(req, res, needApiKey = true) {
+const PROMOTION_COOLDOWN_MS = 30 * 60 * 1000;
+
+// Configure um Persistent Disk no Render em /var/data e a variável EB_DATA_DIR=/var/data.
+// Sem disco persistente, o arquivo funciona no processo atual, mas o Render pode apagá-lo em novas implantações.
+const DATA_DIR = process.env.EB_DATA_DIR || path.join(__dirname, 'data');
+const STATE_FILE = path.join(DATA_DIR, 'eb-manager-state.json');
+const PROOF_DIR = path.join(DATA_DIR, 'proofs');
+
+let persistenceChain = Promise.resolve();
+let databaseTableReady = false;
+
+async function ensureDatabaseStateTable() {
+  if (!statePool || databaseTableReady) return;
+
+  await statePool.query(`
+    CREATE TABLE IF NOT EXISTS eb_manager_state (
+      state_key TEXT PRIMARY KEY,
+      payload JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  databaseTableReady = true;
+}
+
+function promotionAccess(req, res, needApiKey = true) {
   const user = sessionUser(req);
 
   if (!user) {
@@ -358,24 +379,7 @@ async function promotionAccess(req, res, needApiKey = true) {
     return null;
   }
 
-  // O criador cadastrado em ADMIN_USER_IDS tem acesso administrativo.
-  const isAdmin = ADMIN_USER_IDS.has(String(user.sub));
-
-  if (isAdmin) {
-    if (needApiKey && !ROBLOX_API_KEY) {
-      jsonError(
-        res,
-        503,
-        'A integração do Roblox ainda não está configurada. Adicione ROBLOX_API_KEY nas variáveis do Render.'
-      );
-      return null;
-    }
-
-    return user;
-  }
-
-  // Para os demais usuários, validar a patente no grupo Roblox.
-  if (!ROBLOX_API_KEY) {
+  if (needApiKey && !ROBLOX_API_KEY) {
     jsonError(
       res,
       503,
@@ -384,58 +388,362 @@ async function promotionAccess(req, res, needApiKey = true) {
     return null;
   }
 
+  return user;
+}
+
+async function promotionAccessWithRank(req, res, needApiKey = true) {
+  const user = promotionAccess(req, res, needApiKey);
+  if (!user) return null;
+
+  // O criador cadastrado pode administrar mesmo se sua patente no grupo for inferior.
+  if (ADMIN_USER_IDS.has(String(user.sub))) {
+    return {
+      ...user,
+      groupRole: null,
+      isCreatorAdmin: true
+    };
+  }
+
   try {
-    const [roles, membership] = await Promise.all([
-      fetchGroupRoles(),
-      findMembership(user.sub)
-    ]);
+    const roles = await fetchGroupRoles();
+    const membership = await findMembership(user.sub);
+    const actorRole = membership
+      ? highestMembershipRole(roles, membership)
+      : null;
 
-    if (!membership) {
-      jsonError(
-        res,
-        403,
-        'Você precisa ser membro do grupo do Exército Brasileiro para acessar as promoções.'
-      );
-      return null;
-    }
-
-    const actorRole = highestMembershipRole(roles, membership);
-
-    const aspirantRole = roles.find(role =>
-      role.name.trim().toLocaleLowerCase('pt-BR') === 'aspirante a oficial'
+    const aspirantRole = roles.find(
+      role => normalizeRoleName(role.name) === 'aspirante a oficial'
     );
 
-    if (!actorRole || !aspirantRole) {
-      jsonError(
-        res,
-        503,
-        'Não foi possível identificar sua patente ou a patente Aspirante a Oficial no grupo Roblox. Confira os nomes das patentes e a API Key.'
-      );
-      return null;
-    }
-
-    // Ordem menor ou igual à do Aspirante permite acessar as promoções.
-    if (Number(actorRole.order) > Number(aspirantRole.order)) {
+    if (
+      !membership ||
+      !actorRole ||
+      !aspirantRole ||
+      actorRole.order > aspirantRole.order
+    ) {
       jsonError(
         res,
         403,
-        'Apenas Aspirante a Oficial ou uma patente superior pode gerenciar promoções.'
+        'A área de patentes está disponível somente para Aspirante a Oficial ou patente superior.'
       );
       return null;
     }
 
-    return user;
+    return {
+      ...user,
+      groupRole: actorRole,
+      isCreatorAdmin: false
+    };
   } catch (e) {
-    console.error('promotionAccess:', e.status || '', e.message);
-
+    console.error('promotionAccessWithRank:', e.status || '', e.message);
     jsonError(
       res,
       502,
-      'Não foi possível verificar sua patente no grupo Roblox. Confira a API Key e as permissões group:read no Render.'
+      'Não foi possível verificar sua patente no grupo Roblox. Tente novamente.'
     );
-
     return null;
   }
+}
+
+function normalizeRoleName(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[ºª°]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function cooldownRemaining(userId) {
+  const until = Number(promotionCooldowns.get(String(userId)) || 0);
+  return Math.max(0, until - Date.now());
+}
+
+function cooldownMessage(remainingMs) {
+  return `Você já promoveu recentemente. Aguarde ${formatDuration(remainingMs)} para promover novamente. O intervalo é individual para cada promotor.`;
+}
+
+function formatDuration(milliseconds) {
+  const ms = Math.max(0, Number(milliseconds) || 0);
+  const totalMinutes = Math.ceil(ms / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes || !parts.length) parts.push(`${minutes}min`);
+
+  return parts.join(' ');
+}
+
+function beginPromotionOperation(userId, res) {
+  const key = String(userId);
+  const remaining = cooldownRemaining(key);
+
+  if (remaining > 0) {
+    jsonError(res, 429, cooldownMessage(remaining));
+    return false;
+  }
+
+  if (promotionLocks.has(key)) {
+    jsonError(
+      res,
+      409,
+      'Uma operação de promoção sua já está em andamento. Aguarde o resultado antes de tentar novamente.'
+    );
+    return false;
+  }
+
+  promotionLocks.add(key);
+  return true;
+}
+
+function endPromotionOperation(userId) {
+  promotionLocks.delete(String(userId));
+}
+
+function cdpDurationMs(role, roles) {
+  const name = normalizeRoleName(role?.name);
+  const hour = 60 * 60 * 1000;
+
+  // Prazos pedidos: Recruta 2 h, Soldado 4 h, Cabo 8 h.
+  if (/\brecruta\b/.test(name)) return 2 * hour;
+  if (/\bsoldado\b/.test(name)) return 4 * hour;
+  if (/\bcabo\b/.test(name)) return 8 * hour;
+
+  // As patentes acima de Cabo seguem a progressão dobrada: 16 h, 32 h, 64 h...
+  // Para funções abaixo de Cabo que não sejam Recruta/Soldado, reduz proporcionalmente.
+  const caboRole = (roles || []).find(
+    r => /\bcabo\b/.test(normalizeRoleName(r.name))
+  );
+
+  if (caboRole && Number.isFinite(Number(role?.order))) {
+    const steps = Number(caboRole.order) - Number(role.order);
+
+    if (steps > 0) return Math.min(720, 8 * (2 ** steps)) * hour;
+    if (steps < 0) return Math.max(1, 8 / (2 ** Math.abs(steps))) * hour;
+  }
+
+  // Caso o grupo use nomes de patente diferentes, o prazo padrão seguro é 8 horas.
+  return 8 * hour;
+}
+
+function buildCdpStatus(record, roles) {
+  const role = {
+    id: record.roleId,
+    name: record.roleName,
+    order: record.roleOrder
+  };
+
+  const requiredMs = cdpDurationMs(role, roles || []);
+  const startedAt = Number(record.startedAt) || Date.now();
+  const eligibleAt = startedAt + requiredMs;
+  const remainingMs = Math.max(0, eligibleAt - Date.now());
+
+  return {
+    roleName: record.roleName,
+    requiredMs,
+    requiredHours: requiredMs / 3600000,
+    startedAt,
+    eligibleAt,
+    remainingMs,
+    remainingLabel: formatDuration(remainingMs),
+    eligible: remainingMs <= 0,
+    trackedBy: 'site'
+  };
+}
+
+function ensureCdpRecord(userId, username, currentRole, roles) {
+  const key = String(userId);
+  const roleId = String(currentRole.id);
+  let record = cdpRecords.get(key);
+  let changed = false;
+
+  // Se ainda não havia histórico, a contagem começa na primeira consulta no site.
+  // Se a patente mudou fora deste site, o site não conhece a data antiga; inicia um novo prazo observado.
+  if (!record || String(record.roleId) !== roleId) {
+    record = {
+      userId: key,
+      username,
+      roleId,
+      roleName: currentRole.name,
+      roleOrder: Number(currentRole.order),
+      startedAt: Date.now()
+    };
+
+    cdpRecords.set(key, record);
+    changed = true;
+  } else {
+    record.username = username;
+    record.roleName = currentRole.name;
+    record.roleOrder = Number(currentRole.order);
+  }
+
+  return {
+    changed,
+    record,
+    status: buildCdpStatus(record, roles)
+  };
+}
+
+async function savePersistentState() {
+  const snapshot = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    promotionHistory: promotionHistory.slice(0, 100),
+    promotionCooldowns: [...promotionCooldowns.entries()],
+    cdpRecords: [...cdpRecords.entries()],
+    proofFiles: [...proofFiles.entries()].map(([id, proof]) => ({
+      id,
+      filePath: proof.filePath,
+      mimeType: proof.mimeType
+    }))
+  };
+
+  const write = persistenceChain.then(async () => {
+    if (statePool) {
+      await ensureDatabaseStateTable();
+
+      await statePool.query(
+        `INSERT INTO eb_manager_state (state_key, payload, updated_at)
+         VALUES ('main', $1::jsonb, NOW())
+         ON CONFLICT (state_key) DO UPDATE
+         SET payload = EXCLUDED.payload, updated_at = NOW()`,
+        [JSON.stringify(snapshot)]
+      );
+
+      return;
+    }
+
+    await fs.mkdir(DATA_DIR, { recursive: true });
+
+    const tempFile =
+      `${STATE_FILE}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+
+    await fs.writeFile(
+      tempFile,
+      JSON.stringify(snapshot, null, 2),
+      { encoding: 'utf8', mode: 0o600 }
+    );
+
+    await fs.rename(tempFile, STATE_FILE);
+  });
+
+  persistenceChain = write.catch(error => {
+    console.error(
+      'Não foi possível persistir o estado do EB Manager:',
+      error.message
+    );
+  });
+
+  await write;
+}
+
+async function loadPersistentState() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.mkdir(PROOF_DIR, { recursive: true });
+
+  let saved;
+
+  if (statePool) {
+    await ensureDatabaseStateTable();
+
+    const result = await statePool.query(
+      `SELECT payload FROM eb_manager_state WHERE state_key = 'main' LIMIT 1`
+    );
+
+    saved = result.rows[0]?.payload || null;
+  } else {
+    try {
+      saved = JSON.parse(await fs.readFile(STATE_FILE, 'utf8'));
+    } catch (e) {
+      if (e.code !== 'ENOENT') {
+        console.error(
+          'O arquivo de estado não pôde ser lido; um estado novo será iniciado:',
+          e.message
+        );
+      }
+      return;
+    }
+  }
+
+  if (typeof saved === 'string') {
+    try {
+      saved = JSON.parse(saved);
+    } catch {
+      saved = null;
+    }
+  }
+
+  if (!saved || typeof saved !== 'object') return;
+
+  if (Array.isArray(saved.promotionHistory)) {
+    promotionHistory.push(...saved.promotionHistory.slice(0, 100));
+  }
+
+  if (Array.isArray(saved.promotionCooldowns)) {
+    for (const entry of saved.promotionCooldowns) {
+      if (
+        Array.isArray(entry) &&
+        /^\d+$/.test(String(entry[0])) &&
+        Number(entry[1]) > Date.now()
+      ) {
+        promotionCooldowns.set(String(entry[0]), Number(entry[1]));
+      }
+    }
+  }
+
+  if (Array.isArray(saved.cdpRecords)) {
+    for (const entry of saved.cdpRecords) {
+      if (
+        Array.isArray(entry) &&
+        /^\d+$/.test(String(entry[0])) &&
+        entry[1] &&
+        /^\d+$/.test(String(entry[1].roleId)) &&
+        Number(entry[1].startedAt) > 0
+      ) {
+        cdpRecords.set(String(entry[0]), entry[1]);
+      }
+    }
+  }
+
+  if (Array.isArray(saved.proofFiles)) {
+    const proofRoot = path.resolve(PROOF_DIR) + path.sep;
+
+    for (const item of saved.proofFiles) {
+      if (
+        !item ||
+        !/^[a-f0-9]{24}$/.test(String(item.id)) ||
+        !['image/jpeg', 'image/png', 'image/webp'].includes(item.mimeType)
+      ) {
+        continue;
+      }
+
+      const filePath = path.resolve(String(item.filePath || ''));
+
+      if (!filePath.startsWith(proofRoot)) continue;
+
+      try {
+        await fs.access(filePath);
+        proofFiles.set(item.id, {
+          filePath,
+          mimeType: item.mimeType
+        });
+      } catch {
+        // Evidência removida do disco: não carregar link quebrado.
+      }
+    }
+  }
+
+  console.log(
+    `Estado carregado (${statePool ? 'PostgreSQL' : 'arquivo local'}): ` +
+    `${promotionHistory.length} histórico(s), ` +
+    `${promotionCooldowns.size} CDP(s) de promotor e ` +
+    `${cdpRecords.size} CDP(s) de militar.`
+  );
 }
 
 async function readJsonResponse(response) {
@@ -453,7 +761,6 @@ async function readJsonResponse(response) {
     const e = new Error(
       apiMessage || `A API do Roblox respondeu com HTTP ${response.status}.`
     );
-
     e.status = response.status;
     throw e;
   }
@@ -474,10 +781,7 @@ async function fetchGroupRoles() {
 
   do {
     const params = new URLSearchParams({ maxPageSize: '100' });
-
-    if (pageToken) {
-      params.set('pageToken', pageToken);
-    }
+    if (pageToken) params.set('pageToken', pageToken);
 
     const response = await fetch(
       `https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/roles?${params}`,
@@ -560,7 +864,6 @@ function membershipIdOf(membership, fallbackUserId = '') {
     : '';
 
   const match = pathValue.match(/\/memberships\/(\d+)$/);
-
   if (match) return match[1];
 
   for (const candidate of [
@@ -627,9 +930,7 @@ function roleIdsOf(membership) {
 
   const values = [];
 
-  if (membership.role != null) {
-    values.push(membership.role);
-  }
+  if (membership.role != null) values.push(membership.role);
 
   if (Array.isArray(membership.roles)) {
     values.push(...membership.roles);
@@ -643,9 +944,7 @@ function roleIdsOf(membership) {
     'groupRole',
     'group_role'
   ]) {
-    if (membership[key] != null) {
-      values.push(membership[key]);
-    }
+    if (membership[key] != null) values.push(membership[key]);
   }
 
   return [...new Set(values.map(parseRoleId).filter(Boolean))];
@@ -658,56 +957,86 @@ function rankForRole(roles, id) {
 function nextHigherRole(roles, currentRole) {
   if (!currentRole) return null;
 
+  // A ordenação da Open Cloud é de função mais alta para mais baixa.
   return roles
     .filter(role => Number(role.order) < Number(currentRole.order))
     .sort((a, b) => b.order - a.order)[0] || null;
 }
 
 function highestMembershipRole(roles, membership) {
+  // Posição menor = função mais alta (mais autoridade).
   return roleIdsOf(membership)
     .map(id => rankForRole(roles, id))
     .filter(Boolean)
     .sort((a, b) => a.order - b.order)[0] || null;
 }
 
-app.get('/api/promotions/status', (req, res) => {
+app.get('/api/promotions/status', async (req, res) => {
   const user = sessionUser(req);
 
   if (!user) {
     return jsonError(res, 401, 'Sua sessão expirou. Entre novamente pelo Roblox.');
   }
 
-  const admin = ADMIN_USER_IDS.has(String(user.sub));
+  const creatorAdmin = ADMIN_USER_IDS.has(String(user.sub));
+  let canManagePromotions = creatorAdmin;
+
+  if (!creatorAdmin && ROBLOX_API_KEY) {
+    try {
+      const roles = await fetchGroupRoles();
+      const membership = await findMembership(user.sub);
+      const actorRole = membership
+        ? highestMembershipRole(roles, membership)
+        : null;
+
+      const aspirantRole = roles.find(
+        role => normalizeRoleName(role.name) === 'aspirante a oficial'
+      );
+
+      canManagePromotions = Boolean(
+        actorRole &&
+        aspirantRole &&
+        actorRole.order <= aspirantRole.order
+      );
+    } catch (e) {
+      console.error('promotions/status rank check:', e.status || '', e.message);
+    }
+  }
+
+  const now = Date.now();
 
   res.json({
     ok: true,
-    isAdmin: admin,
-    creatorAdmin: admin,
+    isAdmin: canManagePromotions,
+    isConfiguredAdmin: creatorAdmin,
+    creatorAdmin,
+    canManagePromotions,
     integrationConfigured: Boolean(ROBLOX_API_KEY),
     groupId: GROUP_ID,
     userId: String(user.sub),
+    cooldownRemainingMs: cooldownRemaining(user.sub),
+    cooldownUntil: Number(promotionCooldowns.get(String(user.sub)) || 0),
+    serverTime: now,
+    storageBackend: statePool ? 'postgresql' : 'arquivo local',
+    persistentStorageConfigured: Boolean(statePool || process.env.EB_DATA_DIR),
+    storageWarning: !statePool && !process.env.EB_DATA_DIR
+      ? 'O armazenamento está no disco local. No Render Free, os arquivos somem quando o serviço reinicia ou adormece; configure DATABASE_URL para PostgreSQL persistente.'
+      : '',
     setupMissing: [
-      ...(ADMIN_USER_IDS.size ? [] : ['ADMIN_USER_IDS']),
-      ...(ROBLOX_API_KEY ? [] : ['ROBLOX_API_KEY'])
+      ...(!ROBLOX_API_KEY ? ['ROBLOX_API_KEY'] : [])
     ]
   });
 });
 
 app.get('/api/promotions/roles', async (req, res) => {
-  const actor = await promotionAccess(req, res, true);
+  const actor = await promotionAccessWithRank(req, res, true);
   if (!actor) return;
 
   try {
     const roles = await fetchGroupRoles();
-
-    res.json({
-      ok: true,
-      groupId: GROUP_ID,
-      roles
-    });
+    res.json({ ok: true, groupId: GROUP_ID, roles });
   } catch (e) {
     console.error('promotions/roles:', e.message);
-
     return jsonError(
       res,
       502,
@@ -717,7 +1046,7 @@ app.get('/api/promotions/roles', async (req, res) => {
 });
 
 app.post('/api/promotions/search', async (req, res) => {
-  const actor = await promotionAccess(req, res, true);
+  const actor = await promotionAccessWithRank(req, res, true);
   if (!actor) return;
 
   const username = cleanUsername(req.body?.username);
@@ -765,6 +1094,14 @@ app.post('/api/promotions/search', async (req, res) => {
     const roles = await fetchGroupRoles();
     const currentRole = highestMembershipRole(roles, membership);
 
+    if (currentRole && normalizeRoleName(currentRole.name) === 'elite real') {
+      return jsonError(
+        res,
+        403,
+        `@${target.name} está na Elite Real e não pode ser promovido.`
+      );
+    }
+
     if (!currentRole) {
       console.error(
         'Membership response has no matching role reference:',
@@ -777,6 +1114,15 @@ app.post('/api/promotions/search', async (req, res) => {
         'A API encontrou o membro, mas não retornou uma patente reconhecida. A resposta pode usar um formato de função diferente; confira a API Key e os logs do Render.'
       );
     }
+
+    const cdp = ensureCdpRecord(
+      target.id,
+      target.name,
+      currentRole,
+      roles
+    );
+
+    if (cdp.changed) await savePersistentState();
 
     const nextRole = nextHigherRole(roles, currentRole);
 
@@ -800,7 +1146,8 @@ app.post('/api/promotions/search', async (req, res) => {
               rank: nextRole.rank,
               order: nextRole.order
             }
-          : null
+          : null,
+        cdp: cdp.status
       },
       roles
     });
@@ -832,7 +1179,7 @@ app.post('/api/promotions/search', async (req, res) => {
 });
 
 app.post('/api/promotions/execute', async (req, res) => {
-  const actor = await promotionAccess(req, res, true);
+  const actor = await promotionAccessWithRank(req, res, true);
   if (!actor) return;
 
   const username = cleanUsername(req.body?.username);
@@ -848,11 +1195,7 @@ app.post('/api/promotions/execute', async (req, res) => {
     : '';
 
   if (!username) {
-    return jsonError(
-      res,
-      400,
-      'Nome de usuário inválido. Pesquise o membro novamente.'
-    );
+    return jsonError(res, 400, 'Nome de usuário inválido. Pesquise o membro novamente.');
   }
 
   if (!/^\d+$/.test(targetRoleId)) {
@@ -866,6 +1209,8 @@ app.post('/api/promotions/execute', async (req, res) => {
       'Informe o motivo da promoção (mínimo de 3 caracteres).'
     );
   }
+
+  if (!beginPromotionOperation(actor.sub, res)) return;
 
   let promotionPhase = 'validar membro e patente';
 
@@ -906,6 +1251,15 @@ app.post('/api/promotions/execute', async (req, res) => {
 
     const roles = await fetchGroupRoles();
     const currentRole = highestMembershipRole(roles, membership);
+
+    if (currentRole && normalizeRoleName(currentRole.name) === 'elite real') {
+      return jsonError(
+        res,
+        403,
+        `@${target.name} está na Elite Real e não pode ser promovido.`
+      );
+    }
+
     const targetRole = rankForRole(roles, targetRoleId);
 
     if (!currentRole || !targetRole) {
@@ -913,6 +1267,23 @@ app.post('/api/promotions/execute', async (req, res) => {
         res,
         400,
         'A patente atual ou a patente escolhida não foi encontrada no grupo. Atualize e pesquise novamente.'
+      );
+    }
+
+    const cdp = ensureCdpRecord(
+      target.id,
+      target.name,
+      currentRole,
+      roles
+    );
+
+    if (cdp.changed) await savePersistentState();
+
+    if (!cdp.status.eligible) {
+      return jsonError(
+        res,
+        403,
+        `CDP do site ainda não concluído para @${target.name}. Tempo exigido na patente ${currentRole.name}: ${formatDuration(cdp.status.requiredMs)}. Faltam ${formatDuration(cdp.status.remainingMs)}; liberação em ${new Date(cdp.status.eligibleAt).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}.`
       );
     }
 
@@ -954,47 +1325,44 @@ app.post('/api/promotions/execute', async (req, res) => {
 
     const result = await readJsonResponse(response);
 
-    // Atribuir a nova patente não remove necessariamente a anterior.
     let cleanupWarning = '';
 
-    if (currentRole.id !== targetRole.id) {
-      try {
-        promotionPhase = 'remover patente anterior (unassignRole)';
+    try {
+      promotionPhase = 'remover patente anterior (unassignRole)';
 
-        const removeResponse = await fetch(
-          `https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/memberships/${encodeURIComponent(membershipId)}:unassignRole`,
-          {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              accept: 'application/json',
-              'x-api-key': ROBLOX_API_KEY
-            },
-            body: JSON.stringify({
-              role: `groups/${GROUP_ID}/roles/${currentRole.id}`
-            }),
-            signal: AbortSignal.timeout(12000)
-          }
-        );
+      const removeResponse = await fetch(
+        `https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/memberships/${encodeURIComponent(membershipId)}:unassignRole`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json',
+            'x-api-key': ROBLOX_API_KEY
+          },
+          body: JSON.stringify({
+            role: `groups/${GROUP_ID}/roles/${currentRole.id}`
+          }),
+          signal: AbortSignal.timeout(12000)
+        }
+      );
 
-        await readJsonResponse(removeResponse);
-      } catch (removeError) {
-        console.error(
-          'promotions/unassign-old-role:',
-          removeError.status || '',
-          removeError.message
-        );
+      await readJsonResponse(removeResponse);
+    } catch (removeError) {
+      console.error(
+        'promotions/unassign-old-role:',
+        removeError.status || '',
+        removeError.message
+      );
 
-        cleanupWarning =
-          ' A nova patente foi atribuída, mas a patente anterior não pôde ser removida automaticamente; confira os cargos do membro no grupo.';
-      } finally {
-        promotionPhase = 'registrar promoção';
-      }
+      cleanupWarning =
+        ' A nova patente foi atribuída, mas a patente anterior não pôde ser removida automaticamente; confira os cargos do membro no grupo.';
     }
+
+    const now = Date.now();
 
     const entry = {
       id: crypto.randomBytes(5).toString('hex'),
-      at: new Date().toISOString(),
+      at: new Date(now).toISOString(),
       actorId: String(actor.sub),
       actorUsername: actor.username,
       targetId: String(target.id),
@@ -1006,17 +1374,43 @@ app.post('/api/promotions/execute', async (req, res) => {
     };
 
     promotionHistory.unshift(entry);
+    if (promotionHistory.length > 100) promotionHistory.length = 100;
 
-    if (promotionHistory.length > 50) {
-      promotionHistory.length = 50;
+    promotionCooldowns.set(
+      String(actor.sub),
+      now + PROMOTION_COOLDOWN_MS
+    );
+
+    cdpRecords.set(String(target.id), {
+      userId: String(target.id),
+      username: target.name,
+      roleId: String(targetRole.id),
+      roleName: targetRole.name,
+      roleOrder: Number(targetRole.order),
+      startedAt: now
+    });
+
+    promotionPhase = 'salvar histórico, CDP e intervalo';
+
+    let persistenceWarning = '';
+
+    try {
+      await savePersistentState();
+    } catch (saveError) {
+      console.error('promotions/execute/save:', saveError.message);
+
+      persistenceWarning =
+        ' Atenção: não consegui salvar o estado no disco; configure EB_DATA_DIR para um disco persistente no Render para manter os prazos após reinícios.';
     }
 
     return res.json({
       ok: true,
-      message: `Promoção aplicada no Roblox: @${target.name} agora está em ${targetRole.name}.${cleanupWarning}`,
+      message:
+        `Promoção aplicada no Roblox: @${target.name} agora está em ${targetRole.name}.${cleanupWarning} Você poderá promover novamente em 30 minutos.${persistenceWarning}`,
       promotion: entry,
       result,
-      partial: Boolean(cleanupWarning)
+      partial: Boolean(cleanupWarning),
+      cooldownRemainingMs: PROMOTION_COOLDOWN_MS
     });
   } catch (e) {
     console.error(
@@ -1045,7 +1439,7 @@ app.post('/api/promotions/execute', async (req, res) => {
       return jsonError(
         res,
         400,
-        'O Roblox rejeitou a alteração (HTTP 400). Isso pode ocorrer se a função não puder ser atribuída pela chave, se o membro já tiver essa função, ou se a associação/função estiver inválida. Confira o estágio do erro nos Logs do Render.'
+        'O Roblox rejeitou a alteração (HTTP 400). Confira os Logs do Render.'
       );
     }
 
@@ -1062,6 +1456,8 @@ app.post('/api/promotions/execute', async (req, res) => {
       502,
       'Não foi possível concluir a promoção no Roblox. Confira a API Key e as permissões de grupo no Render.'
     );
+  } finally {
+    endPromotionOperation(actor.sub);
   }
 });
 
@@ -1116,7 +1512,11 @@ function parseEvidenceDataUrl(value) {
 
   const extension = match[1] === 'jpeg' ? 'jpg' : match[1];
 
-  return { buffer, mimeType, extension };
+  return {
+    buffer,
+    mimeType,
+    extension
+  };
 }
 
 async function storePromotionEvidence(dataUrl) {
@@ -1161,12 +1561,22 @@ function promotionErrorFor(e) {
 }
 
 app.post('/api/promotions/execute-batch', async (req, res) => {
-  const actor = await promotionAccess(req, res, true);
+  const actor = await promotionAccessWithRank(req, res, true);
   if (!actor) return;
+
+  const cooldown = cooldownRemaining(actor.sub);
+
+  if (cooldown > 0) {
+    return jsonError(res, 429, cooldownMessage(cooldown));
+  }
 
   const rawNames = req.body?.usernames;
 
-  if (!Array.isArray(rawNames) || rawNames.length < 1 || rawNames.length > 20) {
+  if (
+    !Array.isArray(rawNames) ||
+    rawNames.length < 1 ||
+    rawNames.length > 20
+  ) {
     return jsonError(res, 400, 'Adicione de 1 a 20 militares por lote.');
   }
 
@@ -1228,103 +1638,118 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
     );
   }
 
-  const results = [];
+  if (!beginPromotionOperation(actor.sub, res)) return;
 
-  for (const username of usernames) {
-    let phase = 'localizar militar';
+  try {
+    const results = [];
 
-    try {
-      const target = await robloxUserByUsername(username);
-
-      if (!target) {
-        throw Object.assign(
-          new Error('Não encontrei esse usuário no Roblox.'),
-          { status: 404 }
-        );
-      }
-
-      if (String(target.id) === String(actor.sub)) {
-        results.push({
-          username,
-          ok: false,
-          error: 'Você não pode promover sua própria conta por este painel.'
-        });
-
-        continue;
-      }
-
-      phase = 'consultar associação e patente';
-
-      const membership = await findMembership(target.id);
-
-      if (!membership) {
-        results.push({
-          username: target.name,
-          id: target.id,
-          ok: false,
-          error: `@${target.name} não é membro do grupo ${GROUP_ID}.`
-        });
-
-        continue;
-      }
-
-      const membershipId = membershipIdOf(membership, target.id);
-
-      if (!membershipId) {
-        throw new Error(
-          'A API do Roblox não retornou o identificador da associação.'
-        );
-      }
-
-      const currentRole = highestMembershipRole(roles, membership);
-
-      if (!currentRole) {
-        throw new Error(
-          'Não consegui identificar a patente atual desse militar.'
-        );
-      }
-
-      const targetRole = nextHigherRole(roles, currentRole);
-
-      if (!targetRole) {
-        results.push({
-          username: target.name,
-          id: target.id,
-          ok: false,
-          currentRole: currentRole.name,
-          error: `@${target.name} já está na patente mais alta do grupo.`
-        });
-
-        continue;
-      }
-
-      phase = 'atribuir próxima patente';
-
-      const assignResponse = await fetch(
-        `https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/memberships/${encodeURIComponent(membershipId)}:assignRole`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            accept: 'application/json',
-            'x-api-key': ROBLOX_API_KEY
-          },
-          body: JSON.stringify({
-            role: `groups/${GROUP_ID}/roles/${targetRole.id}`
-          }),
-          signal: AbortSignal.timeout(12000)
-        }
-      );
-
-      const assignResult = await readJsonResponse(assignResponse);
-
-      let cleanupWarning = '';
+    for (const username of usernames) {
+      let phase = 'localizar militar';
 
       try {
-        phase = 'remover patente anterior';
+        const target = await robloxUserByUsername(username);
 
-        const removeResponse = await fetch(
-          `https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/memberships/${encodeURIComponent(membershipId)}:unassignRole`,
+        if (!target) {
+          throw Object.assign(
+            new Error('Não encontrei esse usuário no Roblox.'),
+            { status: 404 }
+          );
+        }
+
+        if (String(target.id) === String(actor.sub)) {
+          results.push({
+            username,
+            ok: false,
+            error: 'Você não pode promover sua própria conta por este painel.'
+          });
+          continue;
+        }
+
+        phase = 'consultar associação e patente';
+
+        const membership = await findMembership(target.id);
+
+        if (!membership) {
+          results.push({
+            username: target.name,
+            id: target.id,
+            ok: false,
+            error: `@${target.name} não é membro do grupo ${GROUP_ID}.`
+          });
+          continue;
+        }
+
+        const membershipId = membershipIdOf(membership, target.id);
+
+        if (!membershipId) {
+          throw new Error(
+            'A API do Roblox não retornou o identificador da associação.'
+          );
+        }
+
+        const currentRole = highestMembershipRole(roles, membership);
+
+        if (!currentRole) {
+          throw new Error(
+            'Não consegui identificar a patente atual desse militar.'
+          );
+        }
+
+        if (normalizeRoleName(currentRole.name) === 'elite real') {
+          results.push({
+            username: target.name,
+            id: target.id,
+            ok: false,
+            currentRole: currentRole.name,
+            error: `@${target.name} está na Elite Real e não pode ser promovido.`
+          });
+          continue;
+        }
+
+        const cdp = ensureCdpRecord(
+          target.id,
+          target.name,
+          currentRole,
+          roles
+        );
+
+        if (cdp.changed) await savePersistentState();
+
+        if (!cdp.status.eligible) {
+          results.push({
+            username: target.name,
+            id: target.id,
+            ok: false,
+            currentRole: currentRole.name,
+            cdpRemainingMs: cdp.status.remainingMs,
+            cdpEligibleAt: cdp.status.eligibleAt,
+            error:
+              `CDP do site: precisa permanecer ${formatDuration(cdp.status.requiredMs)} na patente ${currentRole.name}. ` +
+              `Faltam ${formatDuration(cdp.status.remainingMs)}; liberação em ` +
+              `${new Date(cdp.status.eligibleAt).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}.`
+          });
+
+          continue;
+        }
+
+        const targetRole = nextHigherRole(roles, currentRole);
+
+        if (!targetRole) {
+          results.push({
+            username: target.name,
+            id: target.id,
+            ok: false,
+            currentRole: currentRole.name,
+            error: `@${target.name} já está na patente mais alta do grupo.`
+          });
+
+          continue;
+        }
+
+        phase = 'atribuir próxima patente';
+
+        const assignResponse = await fetch(
+          `https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/memberships/${encodeURIComponent(membershipId)}:assignRole`,
           {
             method: 'POST',
             headers: {
@@ -1333,91 +1758,161 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
               'x-api-key': ROBLOX_API_KEY
             },
             body: JSON.stringify({
-              role: `groups/${GROUP_ID}/roles/${currentRole.id}`
+              role: `groups/${GROUP_ID}/roles/${targetRole.id}`
             }),
             signal: AbortSignal.timeout(12000)
           }
         );
 
-        await readJsonResponse(removeResponse);
-      } catch (removeError) {
-        console.error(
-          'promotions/batch/unassign-old-role:',
-          removeError.status || '',
-          removeError.message
+        const assignResult = await readJsonResponse(assignResponse);
+
+        let cleanupWarning = '';
+
+        try {
+          phase = 'remover patente anterior';
+
+          const removeResponse = await fetch(
+            `https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/memberships/${encodeURIComponent(membershipId)}:unassignRole`,
+            {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                accept: 'application/json',
+                'x-api-key': ROBLOX_API_KEY
+              },
+              body: JSON.stringify({
+                role: `groups/${GROUP_ID}/roles/${currentRole.id}`
+              }),
+              signal: AbortSignal.timeout(12000)
+            }
+          );
+
+          await readJsonResponse(removeResponse);
+        } catch (removeError) {
+          console.error(
+            'promotions/batch/unassign-old-role:',
+            removeError.status || '',
+            removeError.message
+          );
+
+          cleanupWarning =
+            'A nova patente foi atribuída, mas a patente anterior não pôde ser removida automaticamente.';
+        }
+
+        const now = Date.now();
+
+        const auditReason =
+          `${trainingType}${note ? ' — ' + note : ''}`.slice(0, 300);
+
+        const entry = {
+          id: crypto.randomBytes(5).toString('hex'),
+          at: new Date(now).toISOString(),
+          actorId: String(actor.sub),
+          actorUsername: actor.username,
+          targetId: String(target.id),
+          targetUsername: target.name,
+          fromRole: currentRole.name,
+          toRole: targetRole.name,
+          reason: auditReason,
+          trainingType,
+          evidenceId: evidence.id,
+          evidenceUrl: `/api/promotions/evidence/${evidence.id}`,
+          cleanupWarning
+        };
+
+        promotionHistory.unshift(entry);
+
+        if (promotionHistory.length > 100) {
+          promotionHistory.length = 100;
+        }
+
+        cdpRecords.set(String(target.id), {
+          userId: String(target.id),
+          username: target.name,
+          roleId: String(targetRole.id),
+          roleName: targetRole.name,
+          roleOrder: Number(targetRole.order),
+          startedAt: now
+        });
+
+        // O intervalo é individual por promotor e começa após uma promoção bem-sucedida.
+        promotionCooldowns.set(
+          String(actor.sub),
+          now + PROMOTION_COOLDOWN_MS
         );
 
-        cleanupWarning =
-          'A nova patente foi atribuída, mas a patente anterior não pôde ser removida automaticamente.';
+        results.push({
+          username: target.name,
+          id: target.id,
+          ok: true,
+          fromRole: currentRole.name,
+          toRole: targetRole.name,
+          warning: cleanupWarning,
+          evidenceUrl: entry.evidenceUrl,
+          result: assignResult
+        });
+      } catch (e) {
+        console.error(
+          `promotions/execute-batch [@${username}; ${phase}]:`,
+          e.status || '',
+          e.message
+        );
+
+        results.push({
+          username,
+          ok: false,
+          error: promotionErrorFor(e),
+          phase
+        });
       }
+    }
 
-      const auditReason =
-        `${trainingType}${note ? ' — ' + note : ''}`.slice(0, 300);
+    const successful = results.filter(result => result.ok).length;
+    const failed = results.length - successful;
 
-      const entry = {
-        id: crypto.randomBytes(5).toString('hex'),
-        at: new Date().toISOString(),
-        actorId: String(actor.sub),
-        actorUsername: actor.username,
-        targetId: String(target.id),
-        targetUsername: target.name,
-        fromRole: currentRole.name,
-        toRole: targetRole.name,
-        reason: auditReason,
-        trainingType,
-        evidenceId: evidence.id,
-        evidenceUrl: `/api/promotions/evidence/${evidence.id}`,
-        cleanupWarning
-      };
+    let persistenceWarning = '';
 
-      promotionHistory.unshift(entry);
-
-      if (promotionHistory.length > 50) {
-        promotionHistory.length = 50;
-      }
-
-      results.push({
-        username: target.name,
-        id: target.id,
-        ok: true,
-        fromRole: currentRole.name,
-        toRole: targetRole.name,
-        warning: cleanupWarning,
-        evidenceUrl: entry.evidenceUrl,
-        result: assignResult
-      });
-    } catch (e) {
-      console.error(
-        `promotions/execute-batch [@${username}; ${phase}]:`,
-        e.status || '',
-        e.message
+    if (successful > 0) {
+      promotionCooldowns.set(
+        String(actor.sub),
+        Date.now() + PROMOTION_COOLDOWN_MS
       );
 
-      results.push({
-        username,
-        ok: false,
-        error: promotionErrorFor(e),
-        phase
-      });
+      try {
+        await savePersistentState();
+      } catch (saveError) {
+        console.error(
+          'promotions/execute-batch/save:',
+          saveError.message
+        );
+
+        persistenceWarning =
+          ' Atenção: não consegui salvar os prazos no disco; configure EB_DATA_DIR em um disco persistente no Render.';
+      }
     }
+
+    return res.json({
+      ok: true,
+      message:
+        `Lote concluído: ${successful} promoção(ões) aplicada(s) e ${failed} falha(s).` +
+        `${successful ? ' Você poderá promover novamente em 30 minutos.' : ''}` +
+        persistenceWarning,
+      trainingType,
+      evidenceUrl: `/api/promotions/evidence/${evidence.id}`,
+      successful,
+      failed,
+      results,
+      cooldownRemainingMs: successful
+        ? PROMOTION_COOLDOWN_MS
+        : cooldownRemaining(actor.sub)
+    });
+  } finally {
+    endPromotionOperation(actor.sub);
   }
-
-  const successful = results.filter(result => result.ok).length;
-  const failed = results.length - successful;
-
-  return res.json({
-    ok: true,
-    message: `Lote concluído: ${successful} promoção(ões) aplicada(s) e ${failed} falha(s).`,
-    trainingType,
-    evidenceUrl: `/api/promotions/evidence/${evidence.id}`,
-    successful,
-    failed,
-    results
-  });
 });
 
 app.get('/api/promotions/evidence/:id', async (req, res) => {
-  const actor = await promotionAccess(req, res, false);
+  const actor = await promotionAccessWithRank(req, res, false);
   if (!actor) return;
 
   const id = String(req.params.id || '');
@@ -1444,7 +1939,7 @@ app.get('/api/promotions/evidence/:id', async (req, res) => {
 });
 
 app.get('/api/promotions/history', async (req, res) => {
-  const actor = await promotionAccess(req, res, false);
+  const actor = await promotionAccessWithRank(req, res, false);
   if (!actor) return;
 
   const history = promotionHistory.slice(0, 20).map(entry => ({
@@ -1460,6 +1955,7 @@ app.get('/api/promotions/history', async (req, res) => {
 
   return res.json({ ok: true, history });
 });
+
 
 // Remove códigos expirados e registros antigos de limite de tentativas.
 setInterval(() => {
@@ -1478,6 +1974,22 @@ app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`EB Manager — Emerson rodando na porta ${PORT}`);
-});
+(async () => {
+  try {
+    await loadPersistentState();
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(
+        `EB Manager — Emerson rodando na porta ${PORT}; armazenamento: ` +
+        `${statePool ? 'PostgreSQL persistente' : DATA_DIR}`
+      );
+    });
+  } catch (error) {
+    console.error(
+      'Falha ao preparar o armazenamento do EB Manager:',
+      error.message
+    );
+
+    process.exitCode = 1;
+  }
+})();w
