@@ -174,7 +174,7 @@ let groupMemberSnapshotInitialized = false;
 let groupMemberScanRunning = false;
 let warnedMissingRobloxApiKey = false;
 const reprocessedPatenteIdsThisRun = new Set();
-const PROMOTION_COOLDOWN_MS = 30 * 60 * 1000;
+const PROMOTION_COOLDOWN_MS = 2 * 60 * 1000;
 // Configure um Persistent Disk no Render em /var/data e a variável EB_DATA_DIR=/var/data.
 // Sem disco persistente, o arquivo funciona no processo atual, mas o Render pode apagá-lo em novas implantações.
 const DATA_DIR = process.env.EB_DATA_DIR || path.join(__dirname, 'data');
@@ -1024,7 +1024,7 @@ app.post('/api/promotions/execute', async (req, res) => {
       persistenceWarning = ' Atenção: não consegui salvar os dados. Confira a conexão DATABASE_URL do PostgreSQL no Render.';
     }
 
-    return res.json({ ok: true, message: `Promoção aplicada no Roblox: @${target.name} agora está em ${targetRole.name}.${cleanupWarning} Você poderá promover novamente em 30 minutos.${persistenceWarning}`, promotion: entry, result, partial: Boolean(cleanupWarning), cooldownRemainingMs: PROMOTION_COOLDOWN_MS });
+    return res.json({ ok: true, message: `Promoção aplicada no Roblox: @${target.name} agora está em ${targetRole.name}.${cleanupWarning} Você poderá promover novamente em 2 minutos.${persistenceWarning}`, promotion: entry, result, partial: Boolean(cleanupWarning), cooldownRemainingMs: PROMOTION_COOLDOWN_MS });
   } catch (e) {
     console.error(`promotions/execute [${promotionPhase}]:`, e.status || '', e.message);
     if (e.status === 401 || e.status === 403) return jsonError(res, 502, 'O Roblox recusou a promoção. Confira a API Key (permissão group:write), o grupo autorizado e se sua conta pode atribuir essa patente.');
@@ -1221,7 +1221,7 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
 
     return res.json({
       ok: true,
-      message: `Lote concluído: ${successful} promoção(ões) aplicada(s) e ${failed} falha(s).${successful ? ' Você poderá promover novamente em 30 minutos.' : ''}${persistenceWarning}`,
+      message: `Lote concluído: ${successful} promoção(ões) aplicada(s) e ${failed} falha(s).${successful ? ' Você poderá promover novamente em 2 minutos.' : ''}${persistenceWarning}`,
       trainingType, evidenceUrl: `/api/promotions/evidence/${evidence.id}`, successful, failed, results,
       cooldownRemainingMs: successful ? PROMOTION_COOLDOWN_MS : cooldownRemaining(actor.sub)
     });
@@ -1620,7 +1620,7 @@ app.post('/api/divisions/:key/promote', async (req, res) => {
     const successMessage = currentRole
       ? '@' + target.name + ' foi promovido de ' + currentRole.name + ' para ' + targetRole.name + ' na divisão ' + access.division.name + '.'
       : '@' + target.name + ' estava sem patente identificada e recebeu a patente ' + targetRole.name + ' na divisão ' + access.division.name + '.';
-    return res.json({ ok: true, message: successMessage + cleanupWarning + ' Você poderá fazer outra alteração em 30 minutos.', promotion: entry, result, cooldownRemainingMs: PROMOTION_COOLDOWN_MS });
+    return res.json({ ok: true, message: successMessage + cleanupWarning + ' Você poderá fazer outra alteração em 2 minutos.', promotion: entry, result, cooldownRemainingMs: PROMOTION_COOLDOWN_MS });
   } catch (error) { console.error('divisions/promote [' + access.division.key + '; ' + phase + ']:', error.status || '', error.message); if (error.status === 401 || error.status === 403) return jsonError(res, 502, 'O Roblox recusou a alteração. Confira as permissões group:write da API Key.'); if (error.status === 404) return jsonError(res, 404, 'Membro ou patente não encontrado na divisão.'); if (error.status === 429) return jsonError(res, 429, 'O Roblox limitou as alterações. Aguarde.'); return jsonError(res, 502, 'Não foi possível concluir a promoção na divisão. Confira os Logs do Render.'); }
   finally { endPromotionOperation(access.user.sub); }
 });
