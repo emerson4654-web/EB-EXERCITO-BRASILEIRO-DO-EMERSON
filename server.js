@@ -1090,7 +1090,7 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
     const username = cleanUsername(typeof rawMember === 'string' ? rawMember : rawMember?.username);
     const targetRoleId = typeof rawMember === 'object' && rawMember !== null ? String(rawMember.targetRoleId ?? '') : '';
     if (!username) return jsonError(res, 400, 'Um dos nomes de usuário é inválido. Remova-o da lista e tente novamente.');
-    if (targetRoleId && !/^\\d+$/.test(targetRoleId)) return jsonError(res, 400, 'Uma das patentes escolhidas é inválida. Remova o militar e consulte-o novamente.');
+    if (targetRoleId && !/^\d+$/.test(targetRoleId)) return jsonError(res, 400, 'Uma das patentes escolhidas é inválida. Remova o militar e consulte-o novamente.');
     const key = username.toLowerCase();
     if (!seenNames.has(key)) { seenNames.add(key); assignments.push({ username, targetRoleId }); }
   }
