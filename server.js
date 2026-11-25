@@ -928,7 +928,11 @@ app.post('/api/promotions/search', async (req, res) => {
     const cdp = cdpForMember(target.id, target.name, currentRole, roles);
     if (cdp.changed) await savePersistentState();
     const nextRole = nextHigherRole(roles, currentRole);
-    return res.json({ ok: true, member: { id: target.id, username: target.name, displayName: target.displayName, profileUrl: `https://www.roblox.com/users/${target.id}/profile`, currentRole: { id: currentRole.id, name: currentRole.name, rank: currentRole.rank, order: currentRole.order }, nextRole: nextRole ? { id: nextRole.id, name: nextRole.name, rank: nextRole.rank, order: nextRole.order } : null, cdp: cdp.status }, roles });
+    const allowedTargetRoles = roles
+      .filter(role => Number(role.order) < Number(currentRole.order) && Number(role.order) >= Number(actor.groupRole?.order))
+      .sort((a, b) => Number(b.order) - Number(a.order))
+      .map(role => ({ id: role.id, name: role.name, rank: role.rank, order: role.order }));
+    return res.json({ ok: true, member: { id: target.id, username: target.name, displayName: target.displayName, profileUrl: `https://www.roblox.com/users/${target.id}/profile`, currentRole: { id: currentRole.id, name: currentRole.name, rank: currentRole.rank, order: currentRole.order }, nextRole: nextRole ? { id: nextRole.id, name: nextRole.name, rank: nextRole.rank, order: nextRole.order } : null, allowedTargetRoles, cdp: cdp.status }, roles });
   } catch (e) {
     console.error('promotions/search:', e.status || '', e.message);
     if (e.status === 401 || e.status === 403) return jsonError(res, 502, 'A API Key do Roblox não tem permissão para consultar os membros. Confira no Render se a chave está correta e autorizada para o grupo.');
@@ -972,9 +976,9 @@ app.post('/api/promotions/execute', async (req, res) => {
       return jsonError(res, 403, `CDP do site ainda não concluído para @${target.name}. Tempo exigido na patente ${currentRole.name}: ${formatDuration(cdp.status.requiredMs)}. Faltam ${formatDuration(cdp.status.remainingMs)}; liberação em ${new Date(cdp.status.eligibleAt).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}.`);
     }
 
-    const expectedNextRole = nextHigherRole(roles, currentRole);
-    if (!expectedNextRole) return jsonError(res, 400, `@${target.name} já está na patente mais alta do grupo; não existe promoção acima dela.`);
-    if (targetRole.id !== expectedNextRole.id) return jsonError(res, 400, `Por segurança, só é permitida a próxima patente acima da atual (${currentRole.name} → ${expectedNextRole.name}). Pesquise novamente e tente outra vez.`);
+    if (Number(targetRole.order) >= Number(currentRole.order) || Number(targetRole.order) < Number(actor.groupRole?.order)) {
+      return jsonError(res, 400, 'A patente escolhida precisa estar acima da patente atual e não pode ultrapassar sua própria patente de comandante (' + actor.groupRole.name + ').');
+    }
 
     const url = `https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/memberships/${encodeURIComponent(membershipId)}:assignRole`;
     promotionPhase = 'atribuir nova patente (assignRole)';
@@ -1075,18 +1079,20 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
   const cooldown = cooldownRemaining(actor.sub);
   if (cooldown > 0) return jsonError(res, 429, cooldownMessage(cooldown));
 
-  const rawNames = req.body?.usernames;
-  if (!Array.isArray(rawNames) || rawNames.length < 1 || rawNames.length > 20) {
+  const rawMembers = Array.isArray(req.body?.members) ? req.body.members : req.body?.usernames;
+  if (!Array.isArray(rawMembers) || rawMembers.length < 1 || rawMembers.length > 20) {
     return jsonError(res, 400, 'Adicione de 1 a 20 militares por lote.');
   }
 
-  const usernames = [];
+  const assignments = [];
   const seenNames = new Set();
-  for (const rawName of rawNames) {
-    const username = cleanUsername(rawName);
+  for (const rawMember of rawMembers) {
+    const username = cleanUsername(typeof rawMember === 'string' ? rawMember : rawMember?.username);
+    const targetRoleId = typeof rawMember === 'object' && rawMember !== null ? String(rawMember.targetRoleId ?? '') : '';
     if (!username) return jsonError(res, 400, 'Um dos nomes de usuário é inválido. Remova-o da lista e tente novamente.');
+    if (targetRoleId && !/^\\d+$/.test(targetRoleId)) return jsonError(res, 400, 'Uma das patentes escolhidas é inválida. Remova o militar e consulte-o novamente.');
     const key = username.toLowerCase();
-    if (!seenNames.has(key)) { seenNames.add(key); usernames.push(username); }
+    if (!seenNames.has(key)) { seenNames.add(key); assignments.push({ username, targetRoleId }); }
   }
 
   const trainingType = req.body?.trainingType;
@@ -1110,7 +1116,8 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
   try {
     const results = [];
 
-    for (const username of usernames) {
+    for (const assignment of assignments) {
+      const { username, targetRoleId: requestedRoleId } = assignment;
       let phase = 'localizar militar';
       try {
         const target = await robloxUserByUsername(username);
@@ -1149,13 +1156,18 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
           continue;
         }
 
-        const targetRole = nextHigherRole(roles, currentRole);
+        const nextRole = nextHigherRole(roles, currentRole);
+        const targetRole = requestedRoleId ? rankForRole(roles, requestedRoleId) : nextRole;
         if (!targetRole) {
-          results.push({ username: target.name, id: target.id, ok: false, currentRole: currentRole.name, error: `@${target.name} já está na patente mais alta do grupo.` });
+          results.push({ username: target.name, id: target.id, ok: false, currentRole: currentRole.name, error: requestedRoleId ? 'A patente escolhida não existe mais no grupo. Consulte o militar novamente.' : '@' + target.name + ' já está na patente mais alta do grupo.' });
+          continue;
+        }
+        if (Number(targetRole.order) >= Number(currentRole.order) || Number(targetRole.order) < Number(actor.groupRole?.order)) {
+          results.push({ username: target.name, id: target.id, ok: false, currentRole: currentRole.name, error: 'A patente escolhida precisa estar acima da atual e não pode ultrapassar sua patente de comandante (' + actor.groupRole.name + ').' });
           continue;
         }
 
-        phase = 'atribuir próxima patente';
+        phase = 'atribuir patente escolhida';
         const assignResponse = await fetch(`https://apis.roblox.com/cloud/v2/groups/${GROUP_ID}/memberships/${encodeURIComponent(membershipId)}:assignRole`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', accept: 'application/json', 'x-api-key': ROBLOX_API_KEY },
