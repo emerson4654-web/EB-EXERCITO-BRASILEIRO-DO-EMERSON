@@ -5,15 +5,7 @@ const path = require('path');
 const fs = require('fs/promises');
 const os = require('os');
 
-// Banco PostgreSQL opcional para preservar CDP e cooldowns após reinícios do Render.
-// Sem DATABASE_URL, o site usa um arquivo local (que pode ser apagado em hospedagens gratuitas).
-const DatabasePool = process.env.DATABASE_URL ? require('pg').Pool : null;
-const statePool = DatabasePool
-  ? new DatabasePool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.DATABASE_SSL === 'disable' ? false : { rejectUnauthorized: false }
-    })
-  : null;
+// O estado do site é salvo em arquivo local; configure EB_DATA_DIR para um disco persistente no Render.
 
 const app = express();
 app.disable('x-powered-by');
@@ -181,17 +173,6 @@ const DATA_DIR = process.env.EB_DATA_DIR || path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'eb-manager-state.json');
 const PROOF_DIR = path.join(DATA_DIR, 'proofs');
 let persistenceChain = Promise.resolve();
-let databaseTableReady = false;
-
-async function ensureDatabaseStateTable() {
-  if (!statePool || databaseTableReady) return;
-  await statePool.query(`CREATE TABLE IF NOT EXISTS eb_manager_state (
-    state_key TEXT PRIMARY KEY,
-    payload JSONB NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-  databaseTableReady = true;
-}
 
 function promotionAccess(req, res, needApiKey = true) {
   const user = sessionUser(req);
@@ -401,17 +382,6 @@ async function savePersistentState() {
   };
 
   const write = persistenceChain.then(async () => {
-    if (statePool) {
-      await ensureDatabaseStateTable();
-      await statePool.query(
-        `INSERT INTO eb_manager_state (state_key, payload, updated_at)
-         VALUES ('main', $1::jsonb, NOW())
-         ON CONFLICT (state_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
-        [JSON.stringify(snapshot)]
-      );
-      return;
-    }
-
     await fs.mkdir(DATA_DIR, { recursive: true });
     const tempFile = `${STATE_FILE}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     await fs.writeFile(tempFile, JSON.stringify(snapshot, null, 2), { encoding: 'utf8', mode: 0o600 });
@@ -429,19 +399,11 @@ async function loadPersistentState() {
   await fs.mkdir(PROOF_DIR, { recursive: true });
 
   let saved;
-  if (statePool) {
-    await ensureDatabaseStateTable();
-    const result = await statePool.query(
-      `SELECT payload FROM eb_manager_state WHERE state_key = 'main' LIMIT 1`
-    );
-    saved = result.rows[0]?.payload || null;
-  } else {
-    try {
-      saved = JSON.parse(await fs.readFile(STATE_FILE, 'utf8'));
-    } catch (e) {
-      if (e.code !== 'ENOENT') console.error('O arquivo de estado não pôde ser lido; um estado novo será iniciado:', e.message);
-      return;
-    }
+  try {
+    saved = JSON.parse(await fs.readFile(STATE_FILE, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('O arquivo de estado não pôde ser lido; um estado novo será iniciado:', e.message);
+    return;
   }
 
   if (typeof saved === 'string') {
@@ -489,7 +451,7 @@ async function loadPersistentState() {
       } catch { /* Evidência removida do disco: não carregar link quebrado. */ }
     }
   }
-  console.log(`Estado carregado (${statePool ? 'PostgreSQL' : 'arquivo local'}): ${promotionHistory.length} histórico(s), ${promotionCooldowns.size} CDP(s) de promotor e ${cdpRecords.size} CDP(s) de militar.`);
+  console.log(`Estado carregado do arquivo local: ${promotionHistory.length} histórico(s), ${promotionCooldowns.size} CDP(s) de promotor e ${cdpRecords.size} CDP(s) de militar.`);
 }
 
 async function readJsonResponse(response) {
@@ -886,7 +848,7 @@ app.get('/api/promotions/status', async (req, res) => {
   }
   const now = Date.now();
   const creatorAdmin = roleName && normalizeRoleName(roleName).includes('criador');
-  return res.json({ ok: true, isAdmin: canManagePromotions, isConfiguredAdmin: false, creatorAdmin: Boolean(creatorAdmin), canManagePromotions, roleName, integrationConfigured: Boolean(ROBLOX_API_KEY), groupId: GROUP_ID, userId: String(user.sub), cooldownRemainingMs: cooldownRemaining(user.sub), cooldownUntil: Number(promotionCooldowns.get(String(user.sub)) || 0), serverTime: now, storageBackend: statePool ? 'postgresql' : 'arquivo local', persistentStorageConfigured: Boolean(statePool || process.env.EB_DATA_DIR), storageWarning: !statePool && !process.env.EB_DATA_DIR ? 'O armazenamento está no disco local. No Render Free, os arquivos somem quando o serviço reinicia ou adormece; configure DATABASE_URL para PostgreSQL persistente.' : '', setupMissing: [...(!ROBLOX_API_KEY ? ['ROBLOX_API_KEY'] : [])], rankCheckError });
+  return res.json({ ok: true, isAdmin: canManagePromotions, isConfiguredAdmin: false, creatorAdmin: Boolean(creatorAdmin), canManagePromotions, roleName, integrationConfigured: Boolean(ROBLOX_API_KEY), groupId: GROUP_ID, userId: String(user.sub), cooldownRemainingMs: cooldownRemaining(user.sub), cooldownUntil: Number(promotionCooldowns.get(String(user.sub)) || 0), serverTime: now, storageBackend: 'arquivo local', persistentStorageConfigured: Boolean(process.env.EB_DATA_DIR), storageWarning: !process.env.EB_DATA_DIR ? 'O armazenamento está no disco local. No Render Free, os arquivos somem quando o serviço reinicia ou adormece; configure um disco persistente e defina EB_DATA_DIR.' : '', setupMissing: [...(!ROBLOX_API_KEY ? ['ROBLOX_API_KEY'] : [])], rankCheckError });
 });
 
 app.get('/api/promotions/roles' , async (req, res) => {
@@ -1025,7 +987,7 @@ app.post('/api/promotions/execute', async (req, res) => {
     try { await savePersistentState(); }
     catch (saveError) {
       console.error('promotions/execute/save:', saveError.message);
-      persistenceWarning = ' Atenção: não consegui salvar os dados. Confira a conexão DATABASE_URL do PostgreSQL no Render.';
+      persistenceWarning = ' Atenção: não consegui salvar os dados no arquivo local. Confira a configuração do disco persistente no Render.';
     }
 
     return res.json({ ok: true, message: `Promoção aplicada no Roblox: @${target.name} agora está em ${targetRole.name}.${cleanupWarning} Você poderá promover novamente em 2 minutos.${persistenceWarning}`, promotion: entry, result, partial: Boolean(cleanupWarning), cooldownRemainingMs: PROMOTION_COOLDOWN_MS });
@@ -1227,7 +1189,7 @@ app.post('/api/promotions/execute-batch', async (req, res) => {
       try { await savePersistentState(); }
       catch (saveError) {
         console.error('promotions/execute-batch/save:', saveError.message);
-        persistenceWarning = ' Atenção: não consegui salvar os prazos. Confira a conexão DATABASE_URL do PostgreSQL no Render.';
+        persistenceWarning = ' Atenção: não consegui salvar os prazos no arquivo local. Confira a configuração do disco persistente no Render.';
       }
     }
 
@@ -1860,7 +1822,7 @@ app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
   try {
     await loadPersistentState();
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`EB Manager — Emerson rodando na porta ${PORT}; armazenamento: ${statePool ? 'PostgreSQL persistente' : DATA_DIR}; PATENTE automática=${PATENTE}`);
+      console.log(`EB Manager — Emerson rodando na porta ${PORT}; armazenamento local: ${DATA_DIR}; PATENTE automática=${PATENTE}`);
       startGroupMemberWatcher();
     });
   } catch (error) {
